@@ -24,16 +24,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/features"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
@@ -81,6 +85,49 @@ type GrpcProxyAgentOptions struct {
 
 	// file contains service account authorization token for enabling proxy-server token based authorization
 	serviceAccountTokenPath string
+
+	bindAddress      string
+	apiServerMapping portMapping
+}
+
+// port mapping represents the mapping between a local port and a remote
+// destination.
+type portMapping struct {
+	localPort  int
+	remoteHost string
+	remotePort int
+}
+
+func (pm *portMapping) String() string {
+	return fmt.Sprintf("%d:%s:%d", pm.localPort, pm.remoteHost, pm.remotePort)
+}
+
+func (pm *portMapping) Set(s string) error {
+	i := strings.Index(s, ":")
+	if i < 0 || i == len(s)-1 {
+		return fmt.Errorf("malformed port mapping %q, expected format: <local_port>:<remote_host>:<remote_port>", s)
+	}
+	rawLocPort := s[:i]
+	localPort, err := strconv.Atoi(rawLocPort)
+	if err != nil {
+		return fmt.Errorf("error occurred while parsing local port: %v", err)
+	}
+	pm.localPort = localPort
+	h, p, err := net.SplitHostPort(s[i+1:])
+	if err != nil {
+		return fmt.Errorf("error occurred while splitting remote host and port: %v", err)
+	}
+	pm.remoteHost = h
+	remotePort, err := strconv.Atoi(p)
+	if err != nil {
+		return fmt.Errorf("error occurred while parsing remote port: %v", err)
+	}
+	pm.remotePort = remotePort
+	return nil
+}
+
+func (pm *portMapping) Type() string {
+	return "portMapping"
 }
 
 func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) *agent.ClientSetConfig {
@@ -109,6 +156,11 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.DurationVar(&o.probeInterval, "probe-interval", o.probeInterval, "The interval by which the agent periodically checks if its connections to the proxy server are ready.")
 	flags.StringVar(&o.serviceAccountTokenPath, "service-account-token-path", o.serviceAccountTokenPath, "If non-empty proxy agent uses this token to prove its identity to the proxy server.")
 	flags.StringVar(&o.agentIdentifiers, "agent-identifiers", o.agentIdentifiers, "Identifiers of the agent that will be used by the server when choosing agent. N.B. the list of identifiers must be in URL encoded format. e.g.,host=localhost&host=node1.mydomain.com&cidr=127.0.0.1/16&ipv4=1.2.3.4&ipv4=5.6.7.8&ipv6=:::::")
+	flags.StringVar(&o.agentIdentifiers, "target", o.agentIdentifiers, "Identifiers of the agent that will be used by the server when choosing agent. N.B. the list of identifiers must be in URL encoded format. e.g.,host=localhost&host=node1.mydomain.com&cidr=127.0.0.1/16&ipv4=1.2.3.4&ipv4=5.6.7.8&ipv6=:::::")
+	flags.Var(&o.apiServerMapping, "apiserver-mapping", "Mapping between a local port and the host:port used to reach the Kubernetes API Server")
+	flags.StringVar(&o.bindAddress, "bind-address", o.bindAddress, "Address used to listen for traffic generated on cluster network")
+	// add feature gates flag
+	features.DefaultMutableFeatureGate.AddFlag(flags)
 	return flags
 }
 
@@ -202,6 +254,8 @@ func newGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		syncInterval:            1 * time.Second,
 		probeInterval:           1 * time.Second,
 		serviceAccountTokenPath: "",
+		apiServerMapping:        portMapping{localPort: 6443, remoteHost: "localhost", remotePort: 6443},
+		bindAddress:             "127.0.0.1",
 	}
 	return &o
 }
@@ -228,8 +282,16 @@ func (a *Agent) run(o *GrpcProxyAgentOptions) error {
 	}
 
 	stopCh := make(chan struct{})
-	if err := a.runProxyConnection(o, stopCh); err != nil {
+	var err error
+	var cs *agent.ClientSet
+	if cs, err = a.runProxyConnection(o, stopCh); err != nil {
 		return fmt.Errorf("failed to run proxy connection with %v", err)
+	}
+
+	if features.DefaultMutableFeatureGate.Enabled(features.ClusterToMasterTraffic) {
+		if err := a.runControlPlaneProxy(o, cs, stopCh); err != nil {
+			return fmt.Errorf("failed to start listening with %v", err)
+		}
 	}
 
 	if err := a.runHealthServer(o); err != nil {
@@ -245,17 +307,52 @@ func (a *Agent) run(o *GrpcProxyAgentOptions) error {
 	return nil
 }
 
-func (a *Agent) runProxyConnection(o *GrpcProxyAgentOptions, stopCh <-chan struct{}) error {
+func (a *Agent) runProxyConnection(o *GrpcProxyAgentOptions, stopCh <-chan struct{}) (*agent.ClientSet, error) {
 	var tlsConfig *tls.Config
 	var err error
 	if tlsConfig, err = util.GetClientTLSConfig(o.caCert, o.agentCert, o.agentKey, o.proxyServerHost); err != nil {
-		return err
+		return nil, err
 	}
 	dialOption := grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
 	cc := o.ClientSetConfig(dialOption)
 	cs := cc.NewAgentClientSet(stopCh)
 	cs.Serve()
 
+	return cs, nil
+}
+
+func (a *Agent) runControlPlaneProxy(o *GrpcProxyAgentOptions, cs *agent.ClientSet, stopCh <-chan struct{}) error {
+	lc := net.ListenConfig{}
+	listenAddr := net.JoinHostPort(o.bindAddress, strconv.Itoa(o.apiServerMapping.localPort))
+	klog.V(1).InfoS("starting control plane proxy", "listen-address", listenAddr)
+	listener, err := lc.Listen(context.TODO(), "tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			klog.V(2).InfoS("listening for connections", "listen-address", listenAddr)
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-stopCh:
+					return
+				default:
+					klog.ErrorS(err, "Error occurred while waiting for connections")
+				}
+			} else {
+				// Serve each connection in a dedicated goroutine
+				go func() {
+					if err := cs.HandleConnection("tcp", net.JoinHostPort(o.apiServerMapping.remoteHost, strconv.Itoa(o.apiServerMapping.remotePort)), conn); err != nil {
+						if err := conn.Close(); err != nil {
+							klog.ErrorS(err, "Error while closing connection")
+						}
+						klog.ErrorS(err, "Error occurred while handling connection")
+					}
+				}()
+			}
+		}
+	}()
 	return nil
 }
 

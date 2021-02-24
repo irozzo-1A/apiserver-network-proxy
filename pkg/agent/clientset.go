@@ -18,6 +18,8 @@ package agent
 
 import (
 	"fmt"
+	"math/rand"
+	"net"
 	"sync"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/features"
 )
 
 // ClientSet consists of clients connected to each instance of an HA proxy server.
@@ -188,12 +191,41 @@ func (cs *ClientSet) syncOnce() error {
 		return nil
 	}
 	klog.V(2).InfoS("sync added client connecting to proxy server", "serverID", c.serverID)
+	if features.DefaultMutableFeatureGate.Enabled(features.ClusterToMasterTraffic) {
+		go c.ServeBiDirectional()
+	}
 	go c.Serve()
 	return nil
 }
 
 func (cs *ClientSet) Serve() {
 	go cs.sync()
+}
+
+func (cs *ClientSet) HandleConnection(protocol, address string, conn net.Conn) error {
+	// close the connection if no client is available
+	// TODO(irozzo): check if this can be handled better
+	if len(cs.clients) == 0 {
+		klog.V(2).InfoS("no clients available for connection", "protocol", protocol, "address", address)
+		err := conn.Close()
+		if err != nil {
+			klog.ErrorS(err, "error occurred while closing connection because of no available clients", "address", address, "protocol", protocol)
+		}
+		return fmt.Errorf("no client available for handling %s connection to %s", protocol, address)
+	}
+	// pick random client to handle the connection
+	n := rand.Intn(len(cs.clients))
+	var client *Client
+	for _, c := range cs.clients {
+		client = c
+		if n == 0 {
+			break
+		}
+		n--
+	}
+	// this call is blocking until the connection is establised or a timeout is
+	// raised
+	return client.HandleConnection(protocol, address, conn)
 }
 
 func (cs *ClientSet) shutdown() {
