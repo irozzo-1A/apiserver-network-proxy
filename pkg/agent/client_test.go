@@ -3,8 +3,10 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,88 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 )
+
+func TestServeData_ClusterToMaster(t *testing.T) {
+	var err error
+	var stream agent.AgentService_ConnectClient
+	stopCh := make(chan struct{})
+	testClient := &Client{
+		connManager: newConnectionManager(),
+		stopCh:      stopCh,
+		pendingDial: make(map[int64]pendingDialContext),
+	}
+	testClient.stream, stream = pipe()
+
+	// Start agent
+	go testClient.ServeBiDirectional()
+	defer close(stopCh)
+
+	agentConn, clientConn := net.Pipe()
+	go testClient.HandleConnection("tcp", "localhost:6443", agentConn)
+
+	// Expect DIAL_REQ on the server side
+	pkg, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if pkg == nil {
+		t.Fatal("unexpected nil packet")
+	}
+	if pkg.Type != client.PacketType_DIAL_REQ {
+		t.Errorf("expect PacketType_DIAL_REQ; got %v", pkg.Type)
+	}
+
+	dialReq := pkg.Payload.(*client.Packet_DialRequest)
+	if dialReq.DialRequest.Protocol != "tcp" {
+		t.Errorf("expect protocol=tcp; got %v", dialReq.DialRequest.Protocol)
+	}
+
+	// Stimulate sending KAS DIAL_RSP to (Agent) Client
+	dialRsp := newDialRsp(1, "", dialReq.DialRequest.Random)
+	err = stream.Send(dialRsp)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Simulate data sent from a client to the agent
+	_, err = clientConn.Write([]byte("hello"))
+	if err != nil {
+		t.Errorf("error occurred while writing data")
+	}
+
+	// Expect DATA packet arriving at the server side
+	pkg, err = stream.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if pkg == nil {
+		t.Fatal("unexpected nil packet")
+	}
+	if pkg.Type != client.PacketType_DATA {
+		t.Errorf("expect PacketType_DIAL_REQ; got %v", pkg.Type)
+	}
+	data := pkg.Payload.(*client.Packet_Data)
+	if a, e := data.Data.Data, []byte("hello"); !reflect.DeepEqual(a, e) {
+		t.Errorf("expect data=%v; got %v", a, e)
+	}
+
+	// Stimulate sending KAS DIAL_RSP to (Agent) Client
+	dialPacket := newDataPacket(dialRsp.GetDialResponse().ConnectID, []byte("world"))
+	err = stream.Send(dialPacket)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Simulate data at the agent side
+	b := make([]byte, 5)
+	_, err = clientConn.Read(b)
+	if err != nil {
+		t.Errorf("error occurred while reading data")
+	}
+	if a, e := b, []byte("world"); !reflect.DeepEqual(a, e) {
+		t.Errorf("expect data=%v; got %v", a, e)
+	}
+}
 
 func TestServeData_HTTP(t *testing.T) {
 	var err error
@@ -234,6 +318,19 @@ func newDialPacket(protocol, address string, random int64) *client.Packet {
 				Protocol: protocol,
 				Address:  address,
 				Random:   random,
+			},
+		},
+	}
+}
+
+func newDialRsp(connID int64, errorMsg string, random int64) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{
+				ConnectID: connID,
+				Error:     errorMsg,
+				Random:    random,
 			},
 		},
 	}
