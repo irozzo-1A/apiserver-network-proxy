@@ -133,7 +133,7 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.serviceAccountTokenPath, "service-account-token-path", o.serviceAccountTokenPath, "If non-empty proxy agent uses this token to prove its identity to the proxy server.")
 	flags.StringVar(&o.agentIdentifiers, "agent-identifiers", o.agentIdentifiers, "Identifiers of the agent that will be used by the server when choosing agent. N.B. the list of identifiers must be in URL encoded format. e.g.,host=localhost&host=node1.mydomain.com&cidr=127.0.0.1/16&ipv4=1.2.3.4&ipv4=5.6.7.8&ipv6=:::::")
 	flags.StringVar(&o.agentIdentifiers, "target", o.agentIdentifiers, "Identifiers of the agent that will be used by the server when choosing agent. N.B. the list of identifiers must be in URL encoded format. e.g.,host=localhost&host=node1.mydomain.com&cidr=127.0.0.1/16&ipv4=1.2.3.4&ipv4=5.6.7.8&ipv6=:::::")
-	flags.Var(&o.apiServerMapping, "apiserver-mapping", "Mapping between a local port and the host:port used to reach the Kubernetes API Server")
+	flags.Var(&o.apiServerMapping, "kas-port-mapping", "Mapping between a local port and the host:port used to reach the Kubernetes API Server")
 	flags.StringVar(&o.bindAddress, "bind-address", o.bindAddress, "Address used to listen for traffic generated on cluster network")
 	// add feature gates flag
 	features.DefaultMutableFeatureGate.AddFlag(flags)
