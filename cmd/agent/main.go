@@ -24,8 +24,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -90,40 +88,18 @@ type GrpcProxyAgentOptions struct {
 	apiServerMapping portMapping
 }
 
+var _ pflag.Value = &portMapping{}
+
 // port mapping represents the mapping between a local port and a remote
 // destination.
-type portMapping struct {
-	localPort  int
-	remoteHost string
-	remotePort int
-}
+type portMapping agent.PortMapping
 
 func (pm *portMapping) String() string {
-	return fmt.Sprintf("%d:%s:%d", pm.localPort, pm.remoteHost, pm.remotePort)
+	return (*agent.PortMapping)(pm).String()
 }
 
 func (pm *portMapping) Set(s string) error {
-	i := strings.Index(s, ":")
-	if i < 0 || i == len(s)-1 {
-		return fmt.Errorf("malformed port mapping %q, expected format: <local_port>:<remote_host>:<remote_port>", s)
-	}
-	rawLocPort := s[:i]
-	localPort, err := strconv.Atoi(rawLocPort)
-	if err != nil {
-		return fmt.Errorf("error occurred while parsing local port: %v", err)
-	}
-	pm.localPort = localPort
-	h, p, err := net.SplitHostPort(s[i+1:])
-	if err != nil {
-		return fmt.Errorf("error occurred while splitting remote host and port: %v", err)
-	}
-	pm.remoteHost = h
-	remotePort, err := strconv.Atoi(p)
-	if err != nil {
-		return fmt.Errorf("error occurred while parsing remote port: %v", err)
-	}
-	pm.remotePort = remotePort
-	return nil
+	return (*agent.PortMapping)(pm).Parse(s)
 }
 
 func (pm *portMapping) Type() string {
@@ -254,7 +230,7 @@ func newGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		syncInterval:            1 * time.Second,
 		probeInterval:           1 * time.Second,
 		serviceAccountTokenPath: "",
-		apiServerMapping:        portMapping{localPort: 6443, remoteHost: "localhost", remotePort: 6443},
+		apiServerMapping:        portMapping{LocalPort: 6443, RemoteHost: "localhost", RemotePort: 6443},
 		bindAddress:             "127.0.0.1",
 	}
 	return &o
@@ -281,15 +257,15 @@ func (a *Agent) run(o *GrpcProxyAgentOptions) error {
 		return fmt.Errorf("failed to validate agent options with %v", err)
 	}
 
-	stopCh := make(chan struct{})
+	ctx := context.Background()
 	var err error
 	var cs *agent.ClientSet
-	if cs, err = a.runProxyConnection(o, stopCh); err != nil {
+	if cs, err = a.runProxyConnection(ctx, o); err != nil {
 		return fmt.Errorf("failed to run proxy connection with %v", err)
 	}
 
 	if features.DefaultMutableFeatureGate.Enabled(features.ClusterToMasterTraffic) {
-		if err := a.runControlPlaneProxy(o, cs, stopCh); err != nil {
+		if err := a.runControlPlaneProxy(ctx, o, cs); err != nil {
 			return fmt.Errorf("failed to start listening with %v", err)
 		}
 	}
@@ -302,12 +278,12 @@ func (a *Agent) run(o *GrpcProxyAgentOptions) error {
 		return fmt.Errorf("failed to run admin server with %v", err)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 
 	return nil
 }
 
-func (a *Agent) runProxyConnection(o *GrpcProxyAgentOptions, stopCh <-chan struct{}) (*agent.ClientSet, error) {
+func (a *Agent) runProxyConnection(ctx context.Context, o *GrpcProxyAgentOptions) (*agent.ClientSet, error) {
 	var tlsConfig *tls.Config
 	var err error
 	if tlsConfig, err = util.GetClientTLSConfig(o.caCert, o.agentCert, o.agentKey, o.proxyServerHost); err != nil {
@@ -315,45 +291,18 @@ func (a *Agent) runProxyConnection(o *GrpcProxyAgentOptions, stopCh <-chan struc
 	}
 	dialOption := grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))
 	cc := o.ClientSetConfig(dialOption)
-	cs := cc.NewAgentClientSet(stopCh)
+	cs := cc.NewAgentClientSet(ctx.Done())
 	cs.Serve()
 
 	return cs, nil
 }
 
-func (a *Agent) runControlPlaneProxy(o *GrpcProxyAgentOptions, cs *agent.ClientSet, stopCh <-chan struct{}) error {
-	lc := net.ListenConfig{}
-	listenAddr := net.JoinHostPort(o.bindAddress, strconv.Itoa(o.apiServerMapping.localPort))
-	klog.V(1).InfoS("starting control plane proxy", "listen-address", listenAddr)
-	listener, err := lc.Listen(context.TODO(), "tcp", listenAddr)
-	if err != nil {
-		return err
+func (a *Agent) runControlPlaneProxy(ctx context.Context, o *GrpcProxyAgentOptions, cs *agent.ClientSet) error {
+	pf := &agent.PortForwarder{
+		ClientSet:  cs,
+		ListenHost: o.bindAddress,
 	}
-	go func() {
-		for {
-			klog.V(2).InfoS("listening for connections", "listen-address", listenAddr)
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-stopCh:
-					return
-				default:
-					klog.ErrorS(err, "Error occurred while waiting for connections")
-				}
-			} else {
-				// Serve each connection in a dedicated goroutine
-				go func() {
-					if err := cs.HandleConnection("tcp", net.JoinHostPort(o.apiServerMapping.remoteHost, strconv.Itoa(o.apiServerMapping.remotePort)), conn); err != nil {
-						if err := conn.Close(); err != nil {
-							klog.ErrorS(err, "Error while closing connection")
-						}
-						klog.ErrorS(err, "Error occurred while handling connection")
-					}
-				}()
-			}
-		}
-	}()
-	return nil
+	return pf.Serve(ctx, agent.PortMapping{})
 }
 
 func (a *Agent) runHealthServer(o *GrpcProxyAgentOptions) error {

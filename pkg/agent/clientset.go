@@ -202,7 +202,7 @@ func (cs *ClientSet) Serve() {
 	go cs.sync()
 }
 
-func (cs *ClientSet) HandleConnection(protocol, address string, conn net.Conn) error {
+func (cs *ClientSet) handleConnection(protocol, address string, conn net.Conn) error {
 	// close the connection if no client is available
 	// TODO(irozzo): check if this can be handled better
 	if len(cs.clients) == 0 {
@@ -214,7 +214,7 @@ func (cs *ClientSet) HandleConnection(protocol, address string, conn net.Conn) e
 		return fmt.Errorf("no client available for handling %s connection to %s", protocol, address)
 	}
 	// pick random client to handle the connection
-	n := rand.Intn(len(cs.clients))
+	n := rand.Intn(len(cs.clients)) /* #nosec G404 */
 	var client *Client
 	for _, c := range cs.clients {
 		client = c
@@ -225,7 +225,7 @@ func (cs *ClientSet) HandleConnection(protocol, address string, conn net.Conn) e
 	}
 	// this call is blocking until the connection is establised or a timeout is
 	// raised
-	return client.HandleConnection(protocol, address, conn)
+	return client.handleConnection(protocol, address, conn)
 }
 
 func (cs *ClientSet) shutdown() {

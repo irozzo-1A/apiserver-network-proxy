@@ -24,7 +24,6 @@ func TestServeData_ClusterToMaster(t *testing.T) {
 	testClient := &Client{
 		connManager: newConnectionManager(),
 		stopCh:      stopCh,
-		pendingDial: make(map[int64]pendingDialContext),
 	}
 	testClient.stream, stream = pipe()
 
@@ -33,7 +32,7 @@ func TestServeData_ClusterToMaster(t *testing.T) {
 	defer close(stopCh)
 
 	agentConn, clientConn := net.Pipe()
-	go testClient.HandleConnection("tcp", "localhost:6443", agentConn)
+	go testClient.handleConnection("tcp", "localhost:6443", agentConn)
 
 	// Expect DIAL_REQ on the server side
 	pkg, err := stream.Recv()

@@ -53,8 +53,12 @@ func (c *connContext) cleanup() {
 }
 
 type connectionManager struct {
-	mu          sync.RWMutex
+	connLock    sync.RWMutex
 	connections map[int64]*connContext
+
+	// pending dial
+	pendingDial     map[int64]*pendingDialContext
+	pendingDialLock sync.RWMutex
 }
 
 type dialResult struct {
@@ -63,32 +67,33 @@ type dialResult struct {
 }
 
 type pendingDialContext struct {
-	resCh chan dialResult
-	conn  net.Conn
+	resCh  chan dialResult
+	conn   net.Conn
+	random int64
 }
 
 func (cm *connectionManager) Add(connID int64, ctx *connContext) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.connLock.Lock()
+	defer cm.connLock.Unlock()
 	cm.connections[connID] = ctx
 }
 
 func (cm *connectionManager) Get(connID int64) (*connContext, bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
+	cm.connLock.RLock()
+	defer cm.connLock.RUnlock()
 	ctx, ok := cm.connections[connID]
 	return ctx, ok
 }
 
 func (cm *connectionManager) Delete(connID int64) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.connLock.Lock()
+	defer cm.connLock.Unlock()
 	delete(cm.connections, connID)
 }
 
 func (cm *connectionManager) List() []*connContext {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
+	cm.connLock.RLock()
+	defer cm.connLock.RUnlock()
 	connContexts := make([]*connContext, 0, len(cm.connections))
 	for _, connCtx := range cm.connections {
 		connContexts = append(connContexts, connCtx)
@@ -96,9 +101,36 @@ func (cm *connectionManager) List() []*connContext {
 	return connContexts
 }
 
+func (cm *connectionManager) AddPendingConnection(conn net.Conn) *pendingDialContext {
+	cm.pendingDialLock.Lock()
+	defer cm.pendingDialLock.Unlock()
+	random := rand.Int63() /* #nosec G404 */
+	pdc := &pendingDialContext{
+		conn:   conn,
+		resCh:  make(chan dialResult),
+		random: random,
+	}
+	cm.pendingDial[random] = pdc
+	return pdc
+}
+
+func (cm *connectionManager) DeletePendingConnection(random int64) {
+	cm.pendingDialLock.Lock()
+	defer cm.pendingDialLock.Unlock()
+	delete(cm.pendingDial, random)
+}
+
+func (cm *connectionManager) GetPendingConnection(random int64) (*pendingDialContext, bool) {
+	cm.pendingDialLock.RLock()
+	defer cm.pendingDialLock.RUnlock()
+	ctx, ok := cm.pendingDial[random]
+	return ctx, ok
+}
+
 func newConnectionManager() *connectionManager {
 	return &connectionManager{
 		connections: make(map[int64]*connContext),
+		pendingDial: make(map[int64]*pendingDialContext),
 	}
 }
 
@@ -174,14 +206,11 @@ type Client struct {
 	// file path contains service account token.
 	// token's value is auto-rotated by kubernetes, based on projected volume configuration.
 	serviceAccountTokenPath string
-
-	// pending dial
-	pendingDial     map[int64]pendingDialContext
-	pendingDialLock sync.RWMutex
 }
 
 func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, opts ...grpc.DialOption) (*Client, int, error) {
 	a := &Client{
+		nextConnID:              0,
 		cs:                      cs,
 		address:                 address,
 		agentID:                 agentID,
@@ -191,7 +220,6 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 		stopCh:                  make(chan struct{}),
 		serviceAccountTokenPath: cs.serviceAccountTokenPath,
 		connManager:             newConnectionManager(),
-		pendingDial:             make(map[int64]pendingDialContext),
 	}
 	serverCount, err := a.Connect()
 	if err != nil {
@@ -368,63 +396,7 @@ func (a *Client) Serve() {
 
 		switch pkt.Type {
 		case client.PacketType_DIAL_REQ:
-			klog.V(4).Infoln("received DIAL_REQ")
-			resp := &client.Packet{
-				Type:    client.PacketType_DIAL_RSP,
-				Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{}},
-			}
-
-			dialReq := pkt.GetDialRequest()
-			resp.GetDialResponse().Random = dialReq.Random
-
-			start := time.Now()
-			conn, err := net.Dial(dialReq.Protocol, dialReq.Address)
-			if err != nil {
-				resp.GetDialResponse().Error = err.Error()
-				if err := a.Send(resp); err != nil {
-					klog.ErrorS(err, "could not send stream")
-				}
-				continue
-			}
-			metrics.Metrics.ObserveDialLatency(time.Since(start))
-
-			connID := atomic.AddInt64(&a.nextConnID, 1)
-			dataCh := make(chan []byte, 5)
-			ctx := &connContext{
-				conn:   conn,
-				dataCh: dataCh,
-				cleanFunc: func() {
-					klog.V(4).InfoS("close connection", "connectionID", connID)
-					resp := &client.Packet{
-						Type:    client.PacketType_CLOSE_RSP,
-						Payload: &client.Packet_CloseResponse{CloseResponse: &client.CloseResponse{}},
-					}
-					resp.GetCloseResponse().ConnectID = connID
-
-					err := conn.Close()
-					if err != nil {
-						resp.GetCloseResponse().Error = err.Error()
-					}
-
-					if err := a.Send(resp); err != nil {
-						klog.ErrorS(err, "close response failure")
-					}
-
-					close(dataCh)
-					a.connManager.Delete(connID)
-				},
-			}
-			a.connManager.Add(connID, ctx)
-
-			resp.GetDialResponse().ConnectID = connID
-			if err := a.Send(resp); err != nil {
-				klog.ErrorS(err, "stream send failure")
-				continue
-			}
-
-			go a.remoteToProxy(connID, ctx)
-			go a.proxyToRemote(connID, ctx)
-
+			a.handleDialRequest(pkt)
 		case client.PacketType_DATA:
 			data := pkt.GetData()
 			klog.V(4).InfoS("received DATA", "connectionID", data.ConnectID)
@@ -435,27 +407,64 @@ func (a *Client) Serve() {
 			}
 
 		case client.PacketType_CLOSE_REQ:
-			closeReq := pkt.GetCloseRequest()
-			connID := closeReq.ConnectID
+			a.handleCloseRequest(pkt)
+		default:
+			klog.V(2).InfoS("unrecognized packet", "type", pkt)
+		}
+	}
+}
 
-			klog.V(4).InfoS("received CLOSE_REQ", "connectionID", connID)
+// ServeBiDirectional starts to serve proxied requests from proxy server and
+// request coming from the agent over the gRPC stream. Successful Connect is
+// required before ServeBiDirectional.
+// The requests include things like opening a connection to a server,
+// streaming data and close the connection.
+func (a *Client) ServeBiDirectional() {
+	klog.V(2).InfoS("Start serving", "serverID", a.serverID)
+	go a.probe()
+	for {
+		select {
+		case <-a.stopCh:
+			klog.V(2).Infoln("stop agent client.")
+			return
+		default:
+		}
 
-			ctx, ok := a.connManager.Get(connID)
-			if ok {
-				ctx.cleanup()
-			} else {
-				resp := &client.Packet{
-					Type:    client.PacketType_CLOSE_RSP,
-					Payload: &client.Packet_CloseResponse{CloseResponse: &client.CloseResponse{}},
-				}
-				resp.GetCloseResponse().ConnectID = connID
-				resp.GetCloseResponse().Error = "Unknown connectID"
-				if err := a.Send(resp); err != nil {
-					klog.ErrorS(err, "close response send failure", err)
-					continue
-				}
+		pkt, err := a.Recv()
+		if err != nil {
+			if err == io.EOF {
+				klog.V(2).Infoln("received EOF, exit")
+				return
 			}
+			klog.ErrorS(err, "could not read stream")
+			return
+		}
 
+		klog.V(5).InfoS("[tracing] recv packet", "type", pkt.Type)
+
+		if pkt == nil {
+			klog.V(3).Infoln("empty packet received")
+			continue
+		}
+
+		switch pkt.Type {
+		case client.PacketType_DIAL_REQ:
+			a.handleDialRequest(pkt)
+		case client.PacketType_DIAL_RSP:
+			a.handleDialResponse(pkt)
+		case client.PacketType_DATA:
+			data := pkt.GetData()
+			klog.V(4).InfoS("received DATA", "connectionID", data.ConnectID)
+
+			ctx, ok := a.connManager.Get(data.ConnectID)
+			if ok {
+				ctx.dataCh <- data.Data
+			}
+		case client.PacketType_CLOSE_RSP:
+			//TODO(irozzo): Handle CLOSE_RSP
+			klog.V(4).InfoS("received CLOSE_RSP", "connectionID", pkt.GetCloseResponse().ConnectID)
+		case client.PacketType_CLOSE_REQ:
+			a.handleCloseRequest(pkt)
 		default:
 			klog.V(2).InfoS("unrecognized packet", "type", pkt)
 		}
@@ -527,9 +536,11 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 	klog.V(4).Infoln("received DIAL_RSP")
 
 	dialRes := pkt.GetDialResponse()
-	pd, ok := a.pendingDial[dialRes.Random]
+	pd, ok := a.connManager.GetPendingConnection(dialRes.Random)
 	if !ok {
-		// handle
+		// TODO(irozzo)
+		klog.Errorf("no pending dial context associated to random %d", dialRes.Random)
+		return
 	} else {
 		pd.resCh <- dialResult{
 			err:    dialRes.Error,
@@ -544,11 +555,17 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 		dataCh: dataCh,
 		cleanFunc: func() {
 			klog.V(4).InfoS("close connection", "connectionID", connID)
+			// TODO(irozzo): We send CLOSE_RSP without having received
+			// CLOSE_REQ, check if it's normal.
+
 			resp := &client.Packet{
-				Type:    client.PacketType_CLOSE_RSP,
-				Payload: &client.Packet_CloseResponse{CloseResponse: &client.CloseResponse{}},
+				Type: client.PacketType_CLOSE_REQ,
+				Payload: &client.Packet_CloseRequest{
+					CloseRequest: &client.CloseRequest{
+						ConnectID: connID,
+					},
+				},
 			}
-			resp.GetCloseResponse().ConnectID = connID
 
 			err := pd.conn.Close()
 			if err != nil {
@@ -592,26 +609,17 @@ func (a *Client) handleCloseRequest(pkt *client.Packet) {
 	}
 }
 
-// HandleConnection connects to the address on the named network, similar to
+// handleConnection connects to the address on the named network, similar to
 // what net.Dial does. The only supported protocol is tcp.
 // TODO(irozzo): check if connection closed while waiting for DIAL_RSP?
-func (a *Client) HandleConnection(protocol, address string, conn net.Conn) error {
+func (a *Client) handleConnection(protocol, address string, conn net.Conn) error {
 	if protocol != "tcp" {
 		return errors.New("protocol not supported")
 	}
 
-	random := rand.Int63() /* #nosec G404 */
-	resCh := make(chan dialResult)
-	a.pendingDialLock.Lock()
-	a.pendingDial[random] = pendingDialContext{
-		conn:  conn,
-		resCh: resCh,
-	}
-	a.pendingDialLock.Unlock()
+	ctx := a.connManager.AddPendingConnection(conn)
 	defer func() {
-		a.pendingDialLock.Lock()
-		delete(a.pendingDial, random)
-		a.pendingDialLock.Unlock()
+		a.connManager.DeletePendingConnection(ctx.random)
 	}()
 
 	req := &client.Packet{
@@ -620,7 +628,7 @@ func (a *Client) HandleConnection(protocol, address string, conn net.Conn) error
 			DialRequest: &client.DialRequest{
 				Protocol: protocol,
 				Address:  address,
-				Random:   random,
+				Random:   ctx.random,
 			},
 		},
 	}
@@ -634,7 +642,7 @@ func (a *Client) HandleConnection(protocol, address string, conn net.Conn) error
 	klog.V(5).Infoln("DIAL_REQ sent to proxy server")
 
 	select {
-	case res := <-resCh:
+	case res := <-ctx.resCh:
 		if res.err != "" {
 			return errors.New(res.err)
 		}
@@ -643,62 +651,6 @@ func (a *Client) HandleConnection(protocol, address string, conn net.Conn) error
 	}
 
 	return nil
-}
-
-// ServeBiDirectional starts to serve proxied requests from proxy server and
-// request coming from the agent over the gRPC stream. Successful Connect is
-// required before ServeBiDirectional.
-// The requests include things like opening a connection to a server,
-// streaming data and close the connection.
-func (a *Client) ServeBiDirectional() {
-	klog.V(2).InfoS("Start serving", "serverID", a.serverID)
-	go a.probe()
-	for {
-		select {
-		case <-a.stopCh:
-			klog.V(2).Infoln("stop agent client.")
-			return
-		default:
-		}
-
-		pkt, err := a.Recv()
-		if err != nil {
-			if err == io.EOF {
-				klog.V(2).Infoln("received EOF, exit")
-				return
-			}
-			klog.ErrorS(err, "could not read stream")
-			return
-		}
-
-		klog.V(5).InfoS("[tracing] recv packet", "type", pkt.Type)
-
-		if pkt == nil {
-			klog.V(3).Infoln("empty packet received")
-			continue
-		}
-
-		switch pkt.Type {
-		case client.PacketType_DIAL_REQ:
-			a.handleDialRequest(pkt)
-		case client.PacketType_DIAL_RSP:
-			a.handleDialResponse(pkt)
-		case client.PacketType_DATA:
-			data := pkt.GetData()
-			klog.V(4).InfoS("received DATA", "connectionID", data.ConnectID)
-
-			ctx, ok := a.connManager.Get(data.ConnectID)
-			if ok {
-				ctx.dataCh <- data.Data
-			}
-
-		//TODO(irozzo): Handle CLOSE_RSP
-		case client.PacketType_CLOSE_REQ:
-			a.handleCloseRequest(pkt)
-		default:
-			klog.V(2).InfoS("unrecognized packet", "type", pkt)
-		}
-	}
 }
 
 func (a *Client) remoteToProxy(connID int64, ctx *connContext) {
