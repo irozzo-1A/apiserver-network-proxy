@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 )
 
-func TestServeData_ClusterToMaster(t *testing.T) {
+func TestServeData_NodeToMaster(t *testing.T) {
 	var err error
 	var stream agent.AgentService_ConnectClient
 	stopCh := make(chan struct{})
@@ -47,8 +47,8 @@ func TestServeData_ClusterToMaster(t *testing.T) {
 	}
 
 	dialReq := pkg.Payload.(*client.Packet_DialRequest)
-	if dialReq.DialRequest.Protocol != "tcp" {
-		t.Errorf("expect protocol=tcp; got %v", dialReq.DialRequest.Protocol)
+	if a, e := *dialReq.DialRequest, (client.DialRequest{Address: "localhost:6443", Protocol: "tcp", Random: dialReq.DialRequest.Random}); !reflect.DeepEqual(a, e) {
+		t.Errorf("expect dial request %v; got %v", e, a)
 	}
 
 	// Stimulate sending KAS DIAL_RSP to (Agent) Client
@@ -73,7 +73,7 @@ func TestServeData_ClusterToMaster(t *testing.T) {
 		t.Fatal("unexpected nil packet")
 	}
 	if pkg.Type != client.PacketType_DATA {
-		t.Errorf("expect PacketType_DIAL_REQ; got %v", pkg.Type)
+		t.Fatalf("expect PacketType_DIAL_REQ; got %v", pkg.Type)
 	}
 	data := pkg.Payload.(*client.Packet_Data)
 	if a, e := data.Data.Data, []byte("hello"); !reflect.DeepEqual(a, e) {
@@ -91,11 +91,31 @@ func TestServeData_ClusterToMaster(t *testing.T) {
 	b := make([]byte, 5)
 	_, err = clientConn.Read(b)
 	if err != nil {
-		t.Errorf("error occurred while reading data")
+		t.Errorf("error occurred while reading data: %v", err)
 	}
 	if a, e := b, []byte("world"); !reflect.DeepEqual(a, e) {
 		t.Errorf("expect data=%v; got %v", a, e)
 	}
+
+	// Simulate client closing connection
+	if err := clientConn.Close(); err != nil {
+		t.Errorf("error occurred while reading data: %v", err)
+	}
+	// Expect CLOSE_REQ on the server side
+	pkg, err = stream.Recv()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if pkg == nil {
+		t.Fatal("unexpected nil packet")
+	}
+	if pkg.Type != client.PacketType_CLOSE_REQ || pkg.GetCloseRequest().ConnectID != dialRsp.GetDialResponse().ConnectID {
+		t.Fatalf("expect PacketType_CLOSE_REQ; got %v", pkg.Type)
+	}
+	if a, e := pkg.GetCloseRequest().ConnectID, dialRsp.GetDialResponse().ConnectID; a != e {
+		t.Errorf("expect ConnectID %d; got %d", e, a)
+	}
+
 }
 
 func TestServeData_HTTP(t *testing.T) {

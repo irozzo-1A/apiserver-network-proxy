@@ -541,11 +541,10 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 		// TODO(irozzo)
 		klog.Errorf("no pending dial context associated to random %d", dialRes.Random)
 		return
-	} else {
-		pd.resCh <- dialResult{
-			err:    dialRes.Error,
-			connid: dialRes.ConnectID,
-		}
+	}
+	pd.resCh <- dialResult{
+		err:    dialRes.Error,
+		connid: dialRes.ConnectID,
 	}
 
 	connID := pkt.GetDialResponse().ConnectID
@@ -555,10 +554,13 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 		dataCh: dataCh,
 		cleanFunc: func() {
 			klog.V(4).InfoS("close connection", "connectionID", connID)
-			// TODO(irozzo): We send CLOSE_RSP without having received
-			// CLOSE_REQ, check if it's normal.
 
-			resp := &client.Packet{
+			err := pd.conn.Close()
+			if err != nil {
+				klog.ErrorS(err, "error occurred while closing connection", "connectionID", connID)
+			}
+
+			req := &client.Packet{
 				Type: client.PacketType_CLOSE_REQ,
 				Payload: &client.Packet_CloseRequest{
 					CloseRequest: &client.CloseRequest{
@@ -567,13 +569,8 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 				},
 			}
 
-			err := pd.conn.Close()
-			if err != nil {
-				resp.GetCloseResponse().Error = err.Error()
-			}
-
-			if err := a.Send(resp); err != nil {
-				klog.ErrorS(err, "close response failure")
+			if err := a.Send(req); err != nil {
+				klog.ErrorS(err, "close request failure")
 			}
 
 			close(dataCh)
