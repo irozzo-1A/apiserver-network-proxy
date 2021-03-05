@@ -35,6 +35,7 @@ type ClientSet struct {
 	mu      sync.Mutex         //protects the clients.
 	clients map[string]*Client // map between serverID and the client
 	// connects to this server.
+	serverIDs []string
 
 	agentID     string // ID of this agent
 	address     string // proxy server address. Assuming HA proxy server
@@ -91,6 +92,7 @@ func (cs *ClientSet) addClientLocked(serverID string, c *Client) error {
 		return fmt.Errorf("client for proxy server %s already exists", serverID)
 	}
 	cs.clients[serverID] = c
+	cs.serverIDs = append(cs.serverIDs, serverID)
 	return nil
 
 }
@@ -108,6 +110,13 @@ func (cs *ClientSet) RemoveClient(serverID string) {
 		return
 	}
 	cs.clients[serverID].Close()
+	for i, s := range cs.serverIDs {
+		if s == serverID {
+			cs.serverIDs[i] = cs.serverIDs[len(cs.serverIDs)-1]
+			cs.serverIDs = cs.serverIDs[:len(cs.serverIDs)-1]
+			break
+		}
+	}
 	delete(cs.clients, serverID)
 }
 
@@ -191,7 +200,7 @@ func (cs *ClientSet) syncOnce() error {
 		return nil
 	}
 	klog.V(2).InfoS("sync added client connecting to proxy server", "serverID", c.serverID)
-	if features.DefaultMutableFeatureGate.Enabled(features.ClusterToMasterTraffic) {
+	if features.DefaultMutableFeatureGate.Enabled(features.NodeToMasterTraffic) {
 		go c.ServeBiDirectional()
 	}
 	go c.Serve()
@@ -214,18 +223,10 @@ func (cs *ClientSet) handleConnection(protocol, address string, conn net.Conn) e
 		return fmt.Errorf("no client available for handling %s connection to %s", protocol, address)
 	}
 	// pick random client to handle the connection
-	n := rand.Intn(len(cs.clients)) /* #nosec G404 */
-	var client *Client
-	for _, c := range cs.clients {
-		client = c
-		if n == 0 {
-			break
-		}
-		n--
-	}
+	serverID := cs.serverIDs[rand.Intn(len(cs.serverIDs))] /* #nosec G404 */
 	// this call is blocking until the connection is establised or a timeout is
 	// raised
-	return client.handleConnection(protocol, address, conn)
+	return cs.clients[serverID].handleConnection(protocol, address, conn)
 }
 
 func (cs *ClientSet) shutdown() {
